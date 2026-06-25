@@ -194,7 +194,8 @@ function Get-AzureTableRows {
         }
 
         try {
-            $webResponse = Invoke-WebRequest -Uri $uri -Method GET -Headers $headers -ErrorAction Stop
+            # Use -UseBasicParsing to avoid dependencies on IE rendering engine on Windows PowerShell
+            $webResponse = Invoke-WebRequest -Uri $uri -Method GET -Headers $headers -UseBasicParsing -ErrorAction Stop
             
             # Parse json body
             $json = $webResponse.Content | ConvertFrom-Json
@@ -216,8 +217,16 @@ function Get-AzureTableRows {
                 }
             }
         } catch {
-            Write-Warning "Could not query Azure Table '$TableName': $_"
-            return @()
+            Write-Error "Fatal error querying Azure Table '$TableName': $_"
+            if ($_.Exception.Response) {
+                try {
+                    $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                    $errBody = $reader.ReadToEnd()
+                    Write-Error "Azure Storage error details: $errBody"
+                } catch {}
+            }
+            Write-Error "Cannot proceed with migration when Table Storage queries are failing. Please check your network and StorageConnectionString."
+            exit 1
         }
     } while ($nextPK -or $nextRK)
 
