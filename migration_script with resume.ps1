@@ -166,27 +166,52 @@ function Get-AzureTableRows {
 
     $safePartition = $PartitionKey -replace "[\\/#?`u0000-`u001f`u007f]", '_'
     $filter        = [System.Uri]::EscapeDataString("PartitionKey eq '$safePartition'")
-    $date          = [System.DateTime]::UtcNow.ToString("R")
-    $canonicalized = "/$AccountName/$TableName()"
-    $authHeader    = New-TableAuthHeader -AccountName $AccountName -AccountKey $AccountKey `
-                         -HttpMethod "GET" -ContentMD5 "" -ContentType "application/json" `
-                         -Date $date -CanonicalizedResource $canonicalized
+    
+    $allRows = @()
+    $nextPK  = $null
+    $nextRK  = $null
 
-    $uri     = "https://$AccountName.table.core.windows.net/${TableName}()?\$filter=$filter"
-    $headers = @{
-        "Authorization" = $authHeader
-        "x-ms-date"     = $date
-        "x-ms-version"  = "2019-02-02"
-        "Accept"        = "application/json;odata=nometadata"
-    }
+    do {
+        $date          = [System.DateTime]::UtcNow.ToString("R")
+        $canonicalized = "/$AccountName/$TableName()"
+        $authHeader    = New-TableAuthHeader -AccountName $AccountName -AccountKey $AccountKey `
+                             -HttpMethod "GET" -ContentMD5 "" -ContentType "application/json" `
+                             -Date $date -CanonicalizedResource $canonicalized
 
-    try {
-        $response = Invoke-RestMethod -Uri $uri -Method GET -Headers $headers -ErrorAction Stop
-        return $response.value
-    } catch {
-        Write-Warning "Could not query Azure Table '$TableName': $_"
-        return @()
-    }
+        $uri = "https://$AccountName.table.core.windows.net/${TableName}()?\$filter=$filter"
+        if ($nextPK) {
+            $uri += "&NextPartitionKey=" + [System.Uri]::EscapeDataString($nextPK)
+        }
+        if ($nextRK) {
+            $uri += "&NextRowKey=" + [System.Uri]::EscapeDataString($nextRK)
+        }
+
+        $headers = @{
+            "Authorization" = $authHeader
+            "x-ms-date"     = $date
+            "x-ms-version"  = "2019-02-02"
+            "Accept"        = "application/json;odata=nometadata"
+        }
+
+        try {
+            $webResponse = Invoke-WebRequest -Uri $uri -Method GET -Headers $headers -ErrorAction Stop
+            
+            # Parse json body
+            $json = $webResponse.Content | ConvertFrom-Json
+            if ($json.value) {
+                $allRows += $json.value
+            }
+
+            # Check for continuation headers
+            $nextPK = $webResponse.Headers['x-ms-continuation-NextPartitionKey']
+            $nextRK = $webResponse.Headers['x-ms-continuation-NextRowKey']
+        } catch {
+            Write-Warning "Could not query Azure Table '$TableName': $_"
+            return @()
+        }
+    } while ($nextPK -or $nextRK)
+
+    return $allRows
 }
 
 # ==========================================
