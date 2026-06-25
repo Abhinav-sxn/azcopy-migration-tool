@@ -31,11 +31,13 @@
 # ==========================================
 # DRY RUN CONTROLS
 # ==========================================
-$SimulateResume        = $true    # $true  → shows Resume/Restart popup with fake prior rows
-                                   # $false → fresh-start flow
-$SimulateAzCopyFailure = $false   # $true  → AzCopy "fails" so you can see the error path
-$SimulatedPriorUploads = 3        # How many files to pretend were already Uploaded in prior run
-$SimulatedPriorFailed  = 1        # How many files to pretend Failed in prior run
+$SimulateResume                 = $true    # $true  → shows Resume/Restart popup with fake prior rows
+                                           # $false → fresh-start flow
+$SimulateAzCopyFailure          = $false   # $true  → AzCopy "fails" so you can see the error path
+$SimulateBlobConnectionFailure  = $false   # $true  → simulates Blob connection check failure
+$SimulateTableConnectionFailure = $false   # $true  → simulates Table connection check failure
+$SimulatedPriorUploads          = 3        # How many files to pretend were already Uploaded in prior run
+$SimulatedPriorFailed           = 1        # How many files to pretend Failed in prior run
 
 # ==========================================
 # CONFIGURATION (values don't matter for dry run)
@@ -69,6 +71,10 @@ function Parse-ConnectionString {
 function Ensure-AzureTable {
     param([string]$AccountName, [string]$AccountKey, [string]$TableName)
     Write-Host "  [DRY RUN] Ensure-AzureTable: Would POST to https://$AccountName.table.core.windows.net/Tables" -ForegroundColor DarkGray
+    if ($SimulateTableConnectionFailure) {
+        Write-Host "  [DRY RUN] Connection check failed: Simulating Table connection failure." -ForegroundColor Red
+        return $false
+    }
     Write-Host "  [DRY RUN] Table '$TableName' - simulating: already exists (200/409 OK)" -ForegroundColor DarkGray
     return $true
 }
@@ -158,6 +164,48 @@ function Show-MessageBox {
     return [System.Windows.Forms.MessageBox]::Show($Message, $Title, $Buttons, $Icon)
 }
 
+function Test-BlobConnection {
+    param([string]$DestinationUrl)
+    Write-Host "[Connection Test] Verifying Blob Storage write permission..." -ForegroundColor Yellow
+    if ($SimulateBlobConnectionFailure) {
+        Write-Host "  [-] Connection test failed: Simulated connection failure (403 Forbidden)" -ForegroundColor Red
+        return $false
+    }
+    Write-Host "  [+] Blob Storage connection test: SUCCESS (Write verified)" -ForegroundColor Green
+    return $true
+}
+
+
+# ==========================================
+# CONNECTION PRE-FLIGHT VALIDATION (MOCKED)
+# ==========================================
+Write-Host "Checking connection configurations (DRY RUN)..." -ForegroundColor Cyan
+
+$connParts   = Parse-ConnectionString -ConnectionString $StorageConnectionString
+$AccountName = $connParts["AccountName"]
+$AccountKey  = $connParts["AccountKey"]
+
+if (-not $AccountName -or -not $AccountKey) {
+    Write-Error "Could not parse AccountName or AccountKey from StorageConnectionString. Please check the CONFIGURATION section."
+    exit 1
+}
+
+# 1. Test Table Storage Connection
+Write-Host "[Setup] Validating Azure Table Storage connection..." -ForegroundColor Yellow
+$tableReady = Ensure-AzureTable -AccountName $AccountName -AccountKey $AccountKey -TableName $TableName
+if (-not $tableReady) {
+    Write-Error "Table check failed (dry run). Exiting."
+    exit 1
+}
+
+# 2. Test Blob Storage SAS Connection
+$blobReady = Test-BlobConnection -DestinationUrl $DestinationUrl
+if (-not $blobReady) {
+    Write-Error "Connection check failed: Cannot proceed with invalid DestinationUrl or SAS token."
+    exit 1
+}
+Write-Host "All connection tests passed successfully.`n" -ForegroundColor Green
+
 # ==========================================
 # FOLDER SELECTION
 # ==========================================
@@ -220,10 +268,6 @@ if ($confirmChoice -ne "Yes") {
 # ==========================================
 # SETUP
 # ==========================================
-$connParts   = Parse-ConnectionString -ConnectionString $StorageConnectionString
-$AccountName = $connParts["AccountName"]
-$AccountKey  = $connParts["AccountKey"]
-
 $SourceEncoded  = ConvertTo-AzCopyPath -LocalPath $SourceRaw
 $SourceFolder   = Split-Path $SourceRaw -Leaf
 $MigrationRunId = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -247,16 +291,8 @@ Write-Host "AzCopy log dir   : $LogDirectory  (not created in dry run)"
 Write-Host "Azure Table      : $TableName  (Account: $AccountName)"
 Write-Host "--------------------------------------------------"
 
-# ==========================================
-# AZURE TABLE: Ensure table exists (mocked)
-# ==========================================
-Write-Host "`n[Setup] Ensuring Azure Table '$TableName' exists..." -ForegroundColor Yellow
-$tableReady = Ensure-AzureTable -AccountName $AccountName -AccountKey $AccountKey -TableName $TableName
-if (-not $tableReady) {
-    Write-Error "Table check failed (dry run). Exiting."
-    exit 1
-}
-Write-Host "Azure Table '$TableName' ready." -ForegroundColor Green
+# Azure Table confirmed ready in validation phase
+Write-Host "[Setup] Azure Table '$TableName' connection: VERIFIED." -ForegroundColor Green
 
 # ==========================================
 # SIMULATE PRIOR RUN ROWS (if $SimulateResume = $true)

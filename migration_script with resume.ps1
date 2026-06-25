@@ -351,6 +351,93 @@ function Show-MessageBox {
 }
 
 # ==========================================
+# HELPER: Test Azure Blob SAS URL Connection
+# ==========================================
+function Test-BlobConnection {
+    param([string]$DestinationUrl)
+
+    $parts = $DestinationUrl -split '\?', 2
+    if ($parts.Count -lt 2) {
+        Write-Warning "Invalid DestinationUrl structure. It must contain a '?' separating the container URL from the SAS token query string."
+        return $false
+    }
+    
+    $containerUrl = $parts[0].TrimEnd('/')
+    $sasToken     = $parts[1]
+    
+    # We will attempt to upload a small test block blob to verify write permissions
+    $testFileName = "migration_test_connection_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".txt"
+    $testBlobUrl  = "${containerUrl}/${testFileName}?${sasToken}"
+    
+    $headers = @{
+        "x-ms-blob-type" = "BlockBlob"
+        "x-ms-version"   = "2019-02-02"
+    }
+    $body = "test connection"
+    
+    Write-Host "[Connection Test] Verifying Blob Storage write permission..." -ForegroundColor Yellow
+    try {
+        Invoke-RestMethod -Uri $testBlobUrl -Method Put -Headers $headers -Body $body -ContentType "text/plain" -ErrorAction Stop | Out-Null
+        Write-Host "  [+] Blob Storage connection test: SUCCESS (Write verified)" -ForegroundColor Green
+        
+        # Clean up the test blob by deleting it
+        Write-Host "[Connection Test] Cleaning up test blob..." -ForegroundColor Yellow
+        try {
+            Invoke-RestMethod -Uri $testBlobUrl -Method Delete -Headers @{"x-ms-version" = "2019-02-02"} -ErrorAction Stop | Out-Null
+            Write-Host "  [+] Cleanup: SUCCESS (Test blob deleted)" -ForegroundColor Green
+        } catch {
+            Write-Warning "  [-] Cleanup: FAILED to delete test blob. Details: $_ (This is fine if SAS lacks delete permissions, but write was successful)"
+        }
+        return $true
+    } catch {
+        Write-Host "  [-] Blob Storage connection test: FAILED" -ForegroundColor Red
+        if ($_.Exception.Response) {
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $errBody = $reader.ReadToEnd()
+                Write-Host "  [-] Azure Storage error details: $errBody" -ForegroundColor Red
+            } catch {}
+        } else {
+            Write-Host "  [-] Error details: $_" -ForegroundColor Red
+        }
+        return $false
+    }
+}
+
+
+# ==========================================
+# FOLDER SELECTION
+# ==========================================
+# CONNECTION PRE-FLIGHT VALIDATION
+# ==========================================
+Write-Host "Checking connection configurations..." -ForegroundColor Cyan
+
+$connParts   = Parse-ConnectionString -ConnectionString $StorageConnectionString
+$AccountName = $connParts["AccountName"]
+$AccountKey  = $connParts["AccountKey"]
+
+if (-not $AccountName -or -not $AccountKey) {
+    Write-Error "Could not parse AccountName or AccountKey from StorageConnectionString. Please check the CONFIGURATION section."
+    exit 1
+}
+
+# 1. Test Table Storage Connection
+Write-Host "[Setup] Validating Azure Table Storage connection..." -ForegroundColor Yellow
+$tableReady = Ensure-AzureTable -AccountName $AccountName -AccountKey $AccountKey -TableName $TableName
+if (-not $tableReady) {
+    Write-Error "Connection check failed: Cannot proceed without a working Azure Table connection. Check your StorageConnectionString."
+    exit 1
+}
+
+# 2. Test Blob Storage SAS Connection
+$blobReady = Test-BlobConnection -DestinationUrl $DestinationUrl
+if (-not $blobReady) {
+    Write-Error "Connection check failed: Cannot proceed with invalid DestinationUrl or SAS token."
+    exit 1
+}
+Write-Host "All connection tests passed successfully.`n" -ForegroundColor Green
+
+# ==========================================
 # FOLDER SELECTION
 # ==========================================
 Add-Type -AssemblyName System.Windows.Forms
@@ -416,15 +503,6 @@ if (-not (Test-Path -Path $LogDirectory)) {
     New-Item -ItemType Directory -Path $LogDirectory | Out-Null
 }
 
-$connParts   = Parse-ConnectionString -ConnectionString $StorageConnectionString
-$AccountName = $connParts["AccountName"]
-$AccountKey  = $connParts["AccountKey"]
-
-if (-not $AccountName -or -not $AccountKey) {
-    Write-Error "Could not parse AccountName or AccountKey from StorageConnectionString. Please check the CONFIGURATION section."
-    exit 1
-}
-
 $SourceEncoded  = ConvertTo-AzCopyPath -LocalPath $SourceRaw
 $SourceFolder   = Split-Path $SourceRaw -Leaf   # PartitionKey
 
@@ -442,15 +520,8 @@ Write-Host "AzCopy log dir   : $LogDirectory"
 Write-Host "Azure Table      : $TableName (Account: $AccountName)"
 Write-Host "--------------------------------------------------"
 
-# ==========================================
-# AZURE TABLE: Ensure MigrationLog table exists
-# ==========================================
-Write-Host "`n[Setup] Ensuring Azure Table '$TableName' exists..." -ForegroundColor Yellow
-$tableReady = Ensure-AzureTable -AccountName $AccountName -AccountKey $AccountKey -TableName $TableName
-if (-not $tableReady) {
-    Write-Error "Cannot proceed without a working Azure Table connection. Check your StorageConnectionString."
-    exit 1
-}
+# Azure Table confirmed ready in validation phase
+Write-Host "[Setup] Azure Table '$TableName' connection: VERIFIED." -ForegroundColor Green
 
 # ==========================================
 # RESUME DETECTION: Query the table for existing rows for this folder
