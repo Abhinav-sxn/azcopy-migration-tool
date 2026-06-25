@@ -191,6 +191,7 @@ function Get-AzureTableRows {
             "x-ms-date"     = $date
             "x-ms-version"  = "2019-02-02"
             "Accept"        = "application/json;odata=nometadata"
+            "Content-Type"  = "application/json"
         }
 
         try {
