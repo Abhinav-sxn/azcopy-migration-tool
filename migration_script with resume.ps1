@@ -314,15 +314,12 @@ function Update-AzureTableRow {
         LastUpdated    = (Get-Date -Format "o")
     }
     $body      = $entity | ConvertTo-Json -Compress
-    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
-
-    $contentMD5    = [System.Convert]::ToBase64String(
-                         (New-Object System.Security.Cryptography.MD5CryptoServiceProvider).ComputeHash($bodyBytes))
+    
     $encodedPK     = [System.Uri]::EscapeDataString($safePartition)
     $encodedRK     = [System.Uri]::EscapeDataString($safeRow)
     $canonicalized = "/$AccountName/$TableName(PartitionKey='$safePartition',RowKey='$safeRow')"
     $authHeader    = New-TableAuthHeader -AccountName $AccountName -AccountKey $AccountKey `
-                         -HttpMethod "MERGE" -ContentMD5 $contentMD5 -ContentType "application/json" `
+                         -HttpMethod "MERGE" -ContentMD5 "" -ContentType "application/json" `
                          -Date $date -CanonicalizedResource $canonicalized
 
     $uri     = "https://$AccountName.table.core.windows.net/$TableName(PartitionKey='$encodedPK',RowKey='$encodedRK')"
@@ -331,7 +328,7 @@ function Update-AzureTableRow {
         "x-ms-date"     = $date
         "x-ms-version"  = "2019-02-02"
         "Accept"        = "application/json;odata=nometadata"
-        "Content-MD5"   = $contentMD5
+        "Content-Type"  = "application/json"
         "If-Match"      = "*"   # unconditional update
     }
 
