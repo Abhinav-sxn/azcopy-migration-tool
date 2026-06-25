@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Migrates files from a network drive to Azure Blob Storage using AzCopy with MD5 hashing,
     checksum validation, Azure Table logging, and resume capability.
@@ -17,7 +17,7 @@
     - MigrationLog hash mismatch: Was caused by logging the URL-encoded ("safe_ascii") version of the
       filename (e.g. "versin" instead of "versión"). Fixed by URL-decoding paths before writing to log.
     - Files with no extension: Logged into Azure Table Storage (MigrationLog table) with HasExtension=false.
-      Migration is NOT blocked — the note is written alongside the upload, not before it.
+      Migration is NOT blocked - the note is written alongside the upload, not before it.
     - Large folder timeouts: AzCopy default request timeout raised to handle large transfers.
     - Resume capability: If a previous migration run is detected for the selected folder, the user is
       offered a choice to resume or restart. AzCopy sync handles skipping already-uploaded files.
@@ -28,7 +28,7 @@
 #>
 
 # ==========================================
-# CONFIGURATION — Modify before running
+# CONFIGURATION - Modify before running
 # ==========================================
 
 # The Azure Blob Storage URL with SAS token
@@ -47,7 +47,7 @@ $LogDirectory = "C:\AzCopyLogs"
 # Number of concurrent operations. Lower values (1-4) reduce CPU overhead during MD5 calculation.
 $ConcurrencyValue = 4
 
-# AzCopy request timeout in seconds. Default is 300 — increase for large files/folders.
+# AzCopy request timeout in seconds. Default is 300 - increase for large files/folders.
 # 3600 = 1 hour; raise further if you still see timeouts on very large transfers.
 $RequestTryTimeout = "3600"
 
@@ -167,11 +167,12 @@ function Get-AzureTableRows {
     $safePartition = $PartitionKey -replace "[\\/#?`u0000-`u001f`u007f]", '_'
     $filter        = [System.Uri]::EscapeDataString("PartitionKey eq '$safePartition'")
     
-    $allRows = @()
+    $results = @()
     $nextPK  = $null
     $nextRK  = $null
+    $hasMore = $true
 
-    do {
+    while ($hasMore) {
         $date          = [System.DateTime]::UtcNow.ToString("R")
         $canonicalized = "/$AccountName/$TableName()"
         $authHeader    = New-TableAuthHeader -AccountName $AccountName -AccountKey $AccountKey `
@@ -195,43 +196,30 @@ function Get-AzureTableRows {
         }
 
         try {
-            # Use -UseBasicParsing to avoid dependencies on IE rendering engine on Windows PowerShell
-            $webResponse = Invoke-WebRequest -Uri $uri -Method GET -Headers $headers -UseBasicParsing -ErrorAction Stop
-            
-            # Parse json body
-            $json = $webResponse.Content | ConvertFrom-Json
-            if ($json.value) {
-                $allRows += $json.value
+            $response = Invoke-WebRequest -Uri $uri -Method GET -Headers $headers -UseBasicParsing -ErrorAction Stop
+            $json = $response.Content | ConvertFrom-Json
+            if ($null -ne $json.value) {
+                $results += @($json.value)
             }
 
-            # Check for continuation headers case-insensitively
+            # Check continuation headers case-insensitively
             $nextPK = $null
             $nextRK = $null
-            if ($webResponse.Headers) {
-                foreach ($key in $webResponse.Headers.Keys) {
-                    if ($key -eq "x-ms-continuation-NextPartitionKey") {
-                        $nextPK = $webResponse.Headers[$key]
-                    }
-                    elseif ($key -eq "x-ms-continuation-NextRowKey") {
-                        $nextRK = $webResponse.Headers[$key]
-                    }
-                }
+            foreach ($key in $response.Headers.Keys) {
+                if ($key -like "*NextPartitionKey*") { $nextPK = $response.Headers[$key] }
+                if ($key -like "*NextRowKey*") { $nextRK = $response.Headers[$key] }
+            }
+
+            if (-not $nextPK -and -not $nextRK) {
+                $hasMore = $false
             }
         } catch {
-            Write-Error "Fatal error querying Azure Table '$TableName': $_"
-            if ($_.Exception.Response) {
-                try {
-                    $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-                    $errBody = $reader.ReadToEnd()
-                    Write-Error "Azure Storage error details: $errBody"
-                } catch {}
-            }
-            Write-Error "Cannot proceed with migration when Table Storage queries are failing. Please check your network and StorageConnectionString."
-            exit 1
+            Write-Warning "Could not query Azure Table '$TableName': $_"
+            $hasMore = $false
         }
-    } while ($nextPK -or $nextRK)
+    }
 
-    return $allRows
+    return $results
 }
 
 # ==========================================
@@ -298,7 +286,7 @@ function Write-AzureTableRow {
 }
 
 # ==========================================
-# HELPER: Update an existing entity (MERGE — only sends changed fields).
+# HELPER: Update an existing entity (MERGE - only sends changed fields).
 # Used to update Status, RetryCount, Notes, MigrationRunId on a resume/restart.
 # ==========================================
 function Update-AzureTableRow {
@@ -449,6 +437,101 @@ function Test-BlobConnection {
     }
 }
 
+# ==========================================
+# HELPER: Test Azure Table Storage Write & Delete Permission
+# ==========================================
+function Test-TableWritePermission {
+    param(
+        [string]$AccountName,
+        [string]$AccountKey,
+        [string]$TableName
+    )
+
+    $testPartition = "connection_test"
+    $testRow       = "write_test_" + (Get-Date -Format "yyyyMMdd_HHmmss")
+    
+    Write-Host "[Connection Test] Verifying Table Storage write permission..." -ForegroundColor Yellow
+    
+    # 1. Attempt to POST (Insert) a test entity
+    $date   = [System.DateTime]::UtcNow.ToString("R")
+    $entity = @{
+        PartitionKey   = $testPartition
+        RowKey         = $testRow
+        FilePath       = "table_storage_connection_test_temp"
+        Status         = "Test"
+        Notes          = "Temporary row to test write permission"
+        LoggedAt       = (Get-Date -Format "o")
+    }
+    $body      = $entity | ConvertTo-Json -Compress
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($body)
+
+    $contentMD5    = [System.Convert]::ToBase64String(
+                         (New-Object System.Security.Cryptography.MD5CryptoServiceProvider).ComputeHash($bodyBytes))
+    $canonicalized = "/$AccountName/$TableName"
+    $authHeader    = New-TableAuthHeader -AccountName $AccountName -AccountKey $AccountKey `
+                         -HttpMethod "POST" -ContentMD5 $contentMD5 -ContentType "application/json" `
+                         -Date $date -CanonicalizedResource $canonicalized
+
+    $uri     = "https://$AccountName.table.core.windows.net/$TableName"
+    $headers = @{
+        "Authorization" = $authHeader
+        "x-ms-date"     = $date
+        "x-ms-version"  = "2019-02-02"
+        "Accept"        = "application/json;odata=nometadata"
+        "Content-MD5"   = $contentMD5
+        "Content-Type"  = "application/json"
+    }
+
+    try {
+        Invoke-RestMethod -Uri $uri -Method POST -Headers $headers `
+            -Body $body -ContentType "application/json" -ErrorAction Stop | Out-Null
+        Write-Host "  [+] Table Storage write permission: SUCCESS" -ForegroundColor Green
+    } catch {
+        Write-Host "  [-] Table Storage write permission: FAILED" -ForegroundColor Red
+        if ($_.Exception.Response) {
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $errBody = $reader.ReadToEnd()
+                Write-Host "  [-] Azure Storage error details: $errBody" -ForegroundColor Red
+            } catch {}
+        } else {
+            Write-Host "  [-] Error details: $_" -ForegroundColor Red
+        }
+        return $false
+    }
+
+    # 2. Cleanup: Attempt to DELETE the test entity
+    Write-Host "[Connection Test] Cleaning up test row from table..." -ForegroundColor Yellow
+    
+    $date          = [System.DateTime]::UtcNow.ToString("R")
+    $canonicalized = "/$AccountName/$TableName(PartitionKey='$testPartition',RowKey='$testRow')"
+    $authHeader    = New-TableAuthHeader -AccountName $AccountName -AccountKey $AccountKey `
+                         -HttpMethod "DELETE" -ContentMD5 "" -ContentType "application/json" `
+                         -Date $date -CanonicalizedResource $canonicalized
+
+    $encodedPK     = [System.Uri]::EscapeDataString($testPartition)
+    $encodedRK     = [System.Uri]::EscapeDataString($testRow)
+    $deleteUri     = "https://$AccountName.table.core.windows.net/$TableName(PartitionKey='$encodedPK',RowKey='$encodedRK')"
+    
+    $deleteHeaders = @{
+        "Authorization" = $authHeader
+        "x-ms-date"     = $date
+        "x-ms-version"  = "2019-02-02"
+        "Accept"        = "application/json;odata=nometadata"
+        "If-Match"      = "*"
+        "Content-Type"  = "application/json"
+    }
+
+    try {
+        Invoke-RestMethod -Uri $deleteUri -Method DELETE -Headers $deleteHeaders -ErrorAction Stop | Out-Null
+        Write-Host "  [+] Table Storage cleanup: SUCCESS (Test row deleted)" -ForegroundColor Green
+    } catch {
+        Write-Warning "  [-] Table Storage cleanup: FAILED to delete test row. Details: $_"
+    }
+
+    return $true
+}
+
 
 # ==========================================
 # FOLDER SELECTION
@@ -466,11 +549,18 @@ if (-not $AccountName -or -not $AccountKey) {
     exit 1
 }
 
-# 1. Test Table Storage Connection
+# 1. Test Table Storage Connection (Check table existence / create if needed)
 Write-Host "[Setup] Validating Azure Table Storage connection..." -ForegroundColor Yellow
 $tableReady = Ensure-AzureTable -AccountName $AccountName -AccountKey $AccountKey -TableName $TableName
 if (-not $tableReady) {
     Write-Error "Connection check failed: Cannot proceed without a working Azure Table connection. Check your StorageConnectionString."
+    exit 1
+}
+
+# 1b. Test Table Storage Write & Delete Permission
+$tableWriteReady = Test-TableWritePermission -AccountName $AccountName -AccountKey $AccountKey -TableName $TableName
+if (-not $tableWriteReady) {
+    Write-Error "Connection check failed: Table write/delete permission test failed. Verify storage account permissions (SAS key/token permissions)."
     exit 1
 }
 
@@ -598,8 +688,8 @@ Uploaded      : $uploadedCount file(s)
 Pending/Failed: $pendingCount file(s)
 Total         : $($existingRows.Count) file(s)
 
-Click YES to RESUME — AzCopy will skip already-uploaded files and retry only the remaining ones.
-Click NO  to RESTART — Everything will be re-uploaded from scratch (RetryCount increments for each file).
+Click YES to RESUME - AzCopy will skip already-uploaded files and retry only the remaining ones.
+Click NO  to RESTART - Everything will be re-uploaded from scratch (RetryCount increments for each file).
 Click CANCEL to exit without doing anything.
 "@
 
@@ -627,7 +717,7 @@ foreach ($row in $existingRows) {
 #
 # Fresh start : INSERT new row with RetryCount = 0, Status = Pending
 # Resume      : Only INSERT rows that are missing from the table (new files added since last run);
-#               existing rows are left as-is — AzCopy will re-attempt Pending/Failed ones.
+#               existing rows are left as-is - AzCopy will re-attempt Pending/Failed ones.
 # Restart     : UPDATE every existing row: Status = Pending, RetryCount++
 #               INSERT rows for any new files not in the table yet.
 # ==========================================
@@ -638,7 +728,7 @@ $totalFiles    = 0
 $noExtCount    = 0
 $newFiles      = 0
 $updatedFiles  = 0
-$totalBytes    = [long]0   # sum of all source file sizes — used for MB/s calculation
+$totalBytes    = [long]0   # sum of all source file sizes - used for MB/s calculation
 
 Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
     $file = $_
@@ -652,7 +742,7 @@ Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
     $relativePath = $file.FullName.Substring($SourceRaw.Length).TrimStart('\')
     $safeRow      = $relativePath -replace "[\\/#?`u0000-`u001f`u007f]", '_'
     $hasExt       = ($file.Extension -ne "")
-    $notes        = if (-not $hasExt) { "No file extension — verify file type after migration" } else { "" }
+    $notes        = if (-not $hasExt) { "No file extension - verify file type after migration" } else { "" }
 
     if (-not $hasExt) {
         $noExtCount++
@@ -666,7 +756,7 @@ Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
         $errorNote     = $notes
 
     } catch {
-        Write-Warning "Could not hash: $($file.FullName) — $_"
+        Write-Warning "Could not hash: $($file.FullName) - $_"
         $hash          = "ERROR"
         $statusToWrite = "HashError"
         $errorNote     = "MD5 hash computation failed: $_"
@@ -676,7 +766,7 @@ Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
     $existingRow = $existingRowMap[$safeRow]
 
     if ($null -eq $existingRow) {
-        # File not seen before — always INSERT as fresh entry
+        # File not seen before - always INSERT as fresh entry
         $newFiles++
         Write-AzureTableRow `
             -AccountName    $AccountName `
@@ -693,7 +783,7 @@ Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
             -RetryCount     0
 
     } elseif ($IsRestartMode) {
-        # Restart — bump RetryCount, reset Status so AzCopy re-uploads it
+        # Restart - bump RetryCount, reset Status so AzCopy re-uploads it
         $updatedFiles++
         $newRetryCount = [int]($existingRow.RetryCount) + 1
         Update-AzureTableRow `
@@ -708,7 +798,7 @@ Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
             -RetryCount     $newRetryCount
 
     } elseif ($IsResumeMode) {
-        # Resume — only reset rows that are NOT already done, so they get picked up by AzCopy
+        # Resume - only reset rows that are NOT already done, so they get picked up by AzCopy
         $doneStatuses = @("Uploaded", "Validated")
         if ($existingRow.Status -notin $doneStatuses) {
             $updatedFiles++
@@ -724,7 +814,7 @@ Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
                 -MigrationRunId $MigrationRunId `
                 -RetryCount     $newRetryCount
         }
-        # Uploaded/Validated rows are left untouched — AzCopy sync will skip them
+        # Uploaded/Validated rows are left untouched - AzCopy sync will skip them
     }
     # Fresh start: rows don't exist yet, all handled by the $null branch above
 }
@@ -733,7 +823,7 @@ Write-Host "Pre-flight complete. $totalFiles file(s) scanned | $newFiles new | $
 
 # ==========================================
 # STEP 1: Seed Migration
-# AzCopy sync compares source vs destination — skips files already present and matching.
+# AzCopy sync compares source vs destination - skips files already present and matching.
 # This handles resume naturally: already-uploaded files are skipped automatically.
 # On a restart, all files are re-evaluated by AzCopy (size/LMT check).
 # ==========================================
@@ -744,7 +834,7 @@ if ($IsResumeMode) {
     Write-Host "RESTART MODE: AzCopy will re-evaluate all files. RetryCount incremented in table." -ForegroundColor Cyan
 }
 
-# Start the migration timer — we only measure the actual AzCopy transfer, not pre-flight.
+# Start the migration timer - we only measure the actual AzCopy transfer, not pre-flight.
 $migrationStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 
 # Build the AzCopy upload command dynamically based on the age filter.
@@ -782,7 +872,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # Mark all rows for this folder as Uploaded
-Write-Host "Updating Azure Table — marking all files as Uploaded..." -ForegroundColor Yellow
+Write-Host "Updating Azure Table - marking all files as Uploaded..." -ForegroundColor Yellow
 $allRows = Get-AzureTableRows -AccountName $AccountName -AccountKey $AccountKey `
                -TableName $TableName -PartitionKey $SourceFolder
 
@@ -825,7 +915,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # Mark all Uploaded rows as Validated
-Write-Host "Updating Azure Table — marking all files as Validated..." -ForegroundColor Yellow
+Write-Host "Updating Azure Table - marking all files as Validated..." -ForegroundColor Yellow
 $allRows = Get-AzureTableRows -AccountName $AccountName -AccountKey $AccountKey `
                -TableName $TableName -PartitionKey $SourceFolder
 
@@ -858,7 +948,7 @@ $countFailed    = ($finalRows | Where-Object { $_.Status -eq "Failed" -or $_.Sta
 $countPending   = ($finalRows | Where-Object { $_.Status -eq "Pending"  }).Count
 $countPassed    = $countValidated + $countUploaded   # Uploaded = done but not yet validated
 
-# Migration speed — based on total source bytes divided by the AzCopy wall-clock time.
+# Migration speed - based on total source bytes divided by the AzCopy wall-clock time.
 # On a resume this will over-report MB/s slightly because already-uploaded files are
 # counted in $totalBytes but skipped by AzCopy. It is still a useful directional metric.
 $totalMB            = [math]::Round($totalBytes / 1MB, 2)
