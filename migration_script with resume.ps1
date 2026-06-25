@@ -178,7 +178,7 @@ function Get-AzureTableRows {
                              -HttpMethod "GET" -ContentMD5 "" -ContentType "application/json" `
                              -Date $date -CanonicalizedResource $canonicalized
 
-        $uri = "https://$AccountName.table.core.windows.net/${TableName}()?\$filter=$filter"
+        $uri = "https://$AccountName.table.core.windows.net/${TableName}()?`$filter=$filter"
         if ($nextPK) {
             $uri += "&NextPartitionKey=" + [System.Uri]::EscapeDataString($nextPK)
         }
@@ -202,9 +202,19 @@ function Get-AzureTableRows {
                 $allRows += $json.value
             }
 
-            # Check for continuation headers
-            $nextPK = $webResponse.Headers['x-ms-continuation-NextPartitionKey']
-            $nextRK = $webResponse.Headers['x-ms-continuation-NextRowKey']
+            # Check for continuation headers case-insensitively
+            $nextPK = $null
+            $nextRK = $null
+            if ($webResponse.Headers) {
+                foreach ($key in $webResponse.Headers.Keys) {
+                    if ($key -eq "x-ms-continuation-NextPartitionKey") {
+                        $nextPK = $webResponse.Headers[$key]
+                    }
+                    elseif ($key -eq "x-ms-continuation-NextRowKey") {
+                        $nextRK = $webResponse.Headers[$key]
+                    }
+                }
+            }
         } catch {
             Write-Warning "Could not query Azure Table '$TableName': $_"
             return @()
