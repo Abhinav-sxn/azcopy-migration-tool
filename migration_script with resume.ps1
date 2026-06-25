@@ -185,7 +185,8 @@ function Write-CsvHeader {
 function Write-CsvRow {
     param(
         [string]$CsvPath,
-        [string]$RowKey,
+        [int]   $RowNum,          # sequential row number written to the '#' column
+        [string]$RelativePath,    # sanitised path (backslashes → '_') for the RelativePath column
         [string]$FilePath,
         [string]$MD5Hash,
         [string]$HasExtension,
@@ -195,7 +196,8 @@ function Write-CsvRow {
         [int]   $RetryCount = 0
     )
     $row = @(
-        $RowKey,
+        $RowNum.ToString(),
+        $RelativePath,
         $FilePath,
         $MD5Hash,
         $HasExtension,
@@ -210,7 +212,8 @@ function Write-CsvRow {
 }
 
 # ==========================================
-# HELPER: Load all rows from the CSV into a hashtable keyed by RowKey.
+# HELPER: Load all rows from the CSV into a hashtable keyed by FilePath.
+# FilePath (the decoded full path) is unique per file and has no collision risk.
 # Returns an empty hashtable if the file doesn't exist or has no data rows.
 # ==========================================
 function Import-CsvRowMap {
@@ -219,7 +222,7 @@ function Import-CsvRowMap {
     if (-not (Test-Path $CsvPath)) { return $map }
     $rows = Import-Csv -Path $CsvPath -Encoding UTF8
     foreach ($r in $rows) {
-        $map[$r.RowKey] = $r
+        $map[$r.FilePath] = $r
     }
     return $map
 }
@@ -234,10 +237,12 @@ function Sync-CsvFromMap {
         [hashtable] $RowMap
     )
     Write-CsvHeader -CsvPath $CsvPath
-    foreach ($key in $RowMap.Keys) {
+    # Sort by '#' so the CSV stays in scan order after each rewrite
+    foreach ($key in ($RowMap.Keys | Sort-Object { [int]($RowMap[$_].'#') })) {
         $r = $RowMap[$key]
         $line = @(
-            $r.RowKey,
+            $r.'#',
+            $r.RelativePath,
             $r.FilePath,
             $r.MD5Hash,
             $r.HasExtension,
@@ -258,18 +263,18 @@ function Update-CsvRow {
     param(
         [string]    $CsvPath,
         [hashtable] $RowMap,
-        [string]    $RowKey,
+        [string]    $MapKey,       # the FilePath key used in $currentRunMap
         [string]    $Status,
         [string]    $Notes        = "",
         [string]    $MigrationRunId,
         [int]       $RetryCount
     )
-    if ($RowMap.ContainsKey($RowKey)) {
-        $RowMap[$RowKey].Status         = $Status
-        $RowMap[$RowKey].Notes          = $Notes
-        $RowMap[$RowKey].MigrationRunId = $MigrationRunId
-        $RowMap[$RowKey].RetryCount     = $RetryCount.ToString()
-        $RowMap[$RowKey].LoggedAt       = (Get-Date -Format "o")
+    if ($RowMap.ContainsKey($MapKey)) {
+        $RowMap[$MapKey].Status         = $Status
+        $RowMap[$MapKey].Notes          = $Notes
+        $RowMap[$MapKey].MigrationRunId = $MigrationRunId
+        $RowMap[$MapKey].RetryCount     = $RetryCount.ToString()
+        $RowMap[$MapKey].LoggedAt       = (Get-Date -Format "o")
     }
     # Persist the whole map back to disk
     Sync-CsvFromMap -CsvPath $CsvPath -RowMap $RowMap
@@ -484,6 +489,7 @@ $noExtCount    = 0
 $newFiles      = 0
 $updatedFiles  = 0
 $totalBytes    = [long]0
+$rowCounter    = 0   # sequential row number written to the '#' CSV column
 
 Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
     $file = $_
@@ -492,9 +498,13 @@ Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
     }
 
     $totalFiles++
+    $rowCounter++
     $totalBytes  += $file.Length
     $decodedPath  = ConvertFrom-UrlEncoding -Encoded $file.FullName
     $relativePath = $file.FullName.Substring($SourceRaw.Length).TrimStart('\')
+    # safeRow is only used as the display value in the RelativePath CSV column.
+    # The hashtable is keyed by $decodedPath (full decoded path) which is guaranteed
+    # to be unique — avoiding collisions caused by replacing '\' with '_'.
     $safeRow      = $relativePath -replace "[\\/#?`u0000-`u001f`u007f]", '_'
     $hasExt       = ($file.Extension -ne "")
     $notes        = if (-not $hasExt) { "No file extension — verify file type after migration" } else { "" }
@@ -517,15 +527,16 @@ Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
         if ($notes -ne "") { $errorNote = "$notes | $errorNote" }
     }
 
-    $existingRow = $existingRowMap[$safeRow]
+    # Key lookup uses $decodedPath — unique, collision-free
+    $existingRow = $existingRowMap[$decodedPath]
 
     if ($null -eq $existingRow) {
         # Brand new file — insert fresh entry
         $newFiles++
-        $retryCount = 0
         Write-CsvRow `
             -CsvPath        $CsvPath `
-            -RowKey         $safeRow `
+            -RowNum         $rowCounter `
+            -RelativePath   $safeRow `
             -FilePath       $decodedPath `
             -MD5Hash        $hash `
             -HasExtension   ($hasExt.ToString().ToLower()) `
@@ -534,9 +545,9 @@ Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
             -MigrationRunId $MigrationRunId `
             -RetryCount     0
 
-        # Add to in-memory map so later Update-CsvRow calls work
-        $currentRunMap[$safeRow] = [PSCustomObject]@{
-            RowKey         = $safeRow
+        $currentRunMap[$decodedPath] = [PSCustomObject]@{
+            '#'            = $rowCounter.ToString()
+            RelativePath   = $safeRow
             FilePath       = $decodedPath
             MD5Hash        = $hash
             HasExtension   = ($hasExt.ToString().ToLower())
@@ -551,11 +562,11 @@ Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
         # Restart — bump RetryCount, reset Status
         $updatedFiles++
         $newRetryCount = [int]($existingRow.RetryCount) + 1
-        $retryCount = $newRetryCount
 
         Write-CsvRow `
             -CsvPath        $CsvPath `
-            -RowKey         $safeRow `
+            -RowNum         $rowCounter `
+            -RelativePath   $safeRow `
             -FilePath       $decodedPath `
             -MD5Hash        $hash `
             -HasExtension   ($hasExt.ToString().ToLower()) `
@@ -564,8 +575,9 @@ Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
             -MigrationRunId $MigrationRunId `
             -RetryCount     $newRetryCount
 
-        $currentRunMap[$safeRow] = [PSCustomObject]@{
-            RowKey         = $safeRow
+        $currentRunMap[$decodedPath] = [PSCustomObject]@{
+            '#'            = $rowCounter.ToString()
+            RelativePath   = $safeRow
             FilePath       = $decodedPath
             MD5Hash        = $hash
             HasExtension   = ($hasExt.ToString().ToLower())
@@ -585,7 +597,8 @@ Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
 
         Write-CsvRow `
             -CsvPath        $CsvPath `
-            -RowKey         $safeRow `
+            -RowNum         $rowCounter `
+            -RelativePath   $safeRow `
             -FilePath       $decodedPath `
             -MD5Hash        $hash `
             -HasExtension   ($hasExt.ToString().ToLower()) `
@@ -594,8 +607,9 @@ Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
             -MigrationRunId $MigrationRunId `
             -RetryCount     $carryRetry
 
-        $currentRunMap[$safeRow] = [PSCustomObject]@{
-            RowKey         = $safeRow
+        $currentRunMap[$decodedPath] = [PSCustomObject]@{
+            '#'            = $rowCounter.ToString()
+            RelativePath   = $safeRow
             FilePath       = $decodedPath
             MD5Hash        = $hash
             HasExtension   = ($hasExt.ToString().ToLower())
