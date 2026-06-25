@@ -176,6 +176,28 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
 }
 
 # ==========================================
+# FILE AGE FILTER PROMPT
+# ==========================================
+$YearsInput = Read-Host "`nEnter the minimum age of files to migrate in years (e.g. 7, or press Enter to migrate all files)"
+$CutoffDate = $null
+$IsAgeFiltered = $false
+
+if (-not [string]::IsNullOrWhiteSpace($YearsInput)) {
+    $YearsValue = 0
+    if ([int]::TryParse($YearsInput, [ref]$YearsValue)) {
+        $CurrentYear = (Get-Date).Year
+        $TargetYear = $CurrentYear - $YearsValue
+        $CutoffDate = [DateTime]::new($TargetYear, 12, 31, 23, 59, 59)
+        $IsAgeFiltered = $true
+        Write-Host "Age Filter: Only files modified on or before $($CutoffDate.ToString('dd/MM/yyyy HH:mm:ss')) (<= year $TargetYear) will be migrated." -ForegroundColor Cyan
+    } else {
+        Write-Warning "Invalid input '$YearsInput'. Proceeding with NO date filter (migrating all files)."
+    }
+} else {
+    Write-Host "No age filter specified. Migrating all files." -ForegroundColor Cyan
+}
+
+# ==========================================
 # CONFIRMATION SAFETY CHECK
 # ==========================================
 $DriveName = [System.IO.Path]::GetPathRoot($SourceRaw).TrimEnd('\')
@@ -333,8 +355,12 @@ $updatedFiles = 0
 $totalBytes   = [long]0
 
 Get-ChildItem -Path $SourceRaw -Recurse -File | ForEach-Object {
+    $file = $_
+    if ($IsAgeFiltered -and $file.LastWriteTime -gt $CutoffDate) {
+        return
+    }
+
     $totalFiles++
-    $file         = $_
     $totalBytes  += $file.Length
     $decodedPath  = ConvertFrom-UrlEncoding -Encoded $file.FullName
     $relativePath = $file.FullName.Substring($SourceRaw.Length).TrimStart('\')
@@ -400,7 +426,12 @@ Write-Host "`n[Step 1] Executing Seed Migration (AzCopy sync with --put-md5)..."
 if ($IsResumeMode)  { Write-Host "RESUME MODE: AzCopy will skip files already present in the destination." -ForegroundColor Cyan }
 if ($IsRestartMode) { Write-Host "RESTART MODE: AzCopy will re-evaluate all files. RetryCount incremented in table." -ForegroundColor Cyan }
 
-$dryRunCmd1 = 'azcopy sync "' + $SourceEncoded + '" "[FAKE_DEST_URL]" --put-md5 --recursive=true --log-level=INFO'
+if ($IsAgeFiltered) {
+    $CutoffUtcString = $CutoffDate.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $dryRunCmd1 = "azcopy copy ""$SourceEncoded"" ""[FAKE_DEST_URL]"" --include-before=""$CutoffUtcString"" --put-md5 --recursive=true --overwrite=false --log-level=INFO"
+} else {
+    $dryRunCmd1 = "azcopy sync ""$SourceEncoded"" ""[FAKE_DEST_URL]"" --put-md5 --recursive=true --log-level=INFO"
+}
 Write-Host "  [DRY RUN] Would run: $dryRunCmd1" -ForegroundColor DarkGray
 Write-Host "  [DRY RUN] Simulating AzCopy transfer (sleeping 3 seconds)..." -ForegroundColor DarkGray
 
@@ -450,6 +481,9 @@ if ($SimulateAzCopyFailure) {
 # STEP 2: Checksum Validation (MOCKED)
 # ==========================================
 Write-Host "`n[Step 2] Executing Checksum Validation (Dry-run sync with MD5 comparison)..." -ForegroundColor Yellow
+if ($IsAgeFiltered) {
+    Write-Host "WARNING: Because age filtering is enabled, the validation sync will list newer files as 'to be copied' in its dry-run output. This is expected and safe to ignore." -ForegroundColor DarkYellow
+}
 $dryRunCmd2 = 'azcopy sync "' + $SourceEncoded + '" "[FAKE_DEST_URL]" --compare-hash=MD5 --dry-run --recursive=true --log-level=INFO'
 Write-Host "  [DRY RUN] Would run: $dryRunCmd2" -ForegroundColor DarkGray
 Write-Host "  [DRY RUN] Simulating validation (sleeping 1 second)..." -ForegroundColor DarkGray
