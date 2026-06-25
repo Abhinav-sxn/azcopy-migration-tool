@@ -176,6 +176,26 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
 }
 
 # ==========================================
+# CONFIRMATION SAFETY CHECK
+# ==========================================
+$DriveName = [System.IO.Path]::GetPathRoot($SourceRaw).TrimEnd('\')
+try {
+    $uri = [System.Uri]$DestinationUrl
+    $ContainerName = @($uri.AbsolutePath -split '/' | Where-Object { $_ })[0]
+} catch {
+    $ContainerName = "unknown-container"
+}
+
+$confirmMsg = "$DriveName will be migrated to $ContainerName. Are you sure?"
+$confirmChoice = Show-MessageBox -Message $confirmMsg -Title "Confirm Migration Destination" -Buttons ([System.Windows.Forms.MessageBoxButtons]::YesNo) -Icon ([System.Windows.Forms.MessageBoxIcon]::Warning)
+
+if ($confirmChoice -ne "Yes") {
+    Write-Warning "Migration cancelled by user confirmation."
+    exit
+}
+
+
+# ==========================================
 # SETUP
 # ==========================================
 $connParts   = Parse-ConnectionString -ConnectionString $StorageConnectionString

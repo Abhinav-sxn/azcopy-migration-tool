@@ -1,10 +1,13 @@
 # Temporary helper scripts (not part of the migration tool)
 _fix_encoding.ps1
 _read_summary.ps1
+_create_repo.ps1
+_git_push.ps1
 
 # AzCopy log files
 AzCopyLogs/
 *.log
+output log.md
 
 # Windows
 Thumbs.db

@@ -258,6 +258,19 @@ function ConvertTo-AzCopyPath {
 }
 
 # ==========================================
+# HELPER: Show a Windows message box and return the button clicked.
+# ==========================================
+function Show-MessageBox {
+    param(
+        [string]$Message,
+        [string]$Title,
+        [System.Windows.Forms.MessageBoxButtons]$Buttons,
+        [System.Windows.Forms.MessageBoxIcon]$Icon = [System.Windows.Forms.MessageBoxIcon]::Question
+    )
+    return [System.Windows.Forms.MessageBox]::Show($Message, $Title, $Buttons, $Icon)
+}
+
+# ==========================================
 # FOLDER SELECTION
 # ==========================================
 Add-Type -AssemblyName System.Windows.Forms
@@ -272,6 +285,26 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
     Write-Warning "No folder was selected. Exiting the migration script."
     exit
 }
+
+# ==========================================
+# CONFIRMATION SAFETY CHECK
+# ==========================================
+$DriveName = [System.IO.Path]::GetPathRoot($SourceRaw).TrimEnd('\')
+try {
+    $uri = [System.Uri]$DestinationUrl
+    $ContainerName = @($uri.AbsolutePath -split '/' | Where-Object { $_ })[0]
+} catch {
+    $ContainerName = "unknown-container"
+}
+
+$confirmMsg = "$DriveName will be migrated to $ContainerName. Are you sure?"
+$confirmChoice = Show-MessageBox -Message $confirmMsg -Title "Confirm Migration Destination" -Buttons ([System.Windows.Forms.MessageBoxButtons]::YesNo) -Icon ([System.Windows.Forms.MessageBoxIcon]::Warning)
+
+if ($confirmChoice -ne "Yes") {
+    Write-Warning "Migration cancelled by user confirmation."
+    exit
+}
+
 
 # ==========================================
 # SETUP
